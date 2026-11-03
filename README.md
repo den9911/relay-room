@@ -23,3 +23,8 @@ Use **New room** to generate a fresh room, add cards, mark them done, delete the
 Установите [Rust и Cargo](https://rustup.rs/), выполните `cargo run --release` и откройте <http://127.0.0.1:3001>. В Windows можно запустить `run.bat`, на macOS — `sh run.command`. Откройте ссылку комнаты во второй вкладке: карточки и таймер общие. Сервер работает только на локальном компьютере — на другом устройстве ссылка пока не откроется. Остановка — Ctrl+C.
 
 Создавайте комнату, добавляйте и отмечайте карточки, запускайте общий таймер на 25 минут. Язык и тема сохраняются в браузере. Комнаты сохраняются в `relay-room.sqlite` (путь можно задать через `RELAY_DB`); файл содержит данные комнат, храните его как личный. Сейчас поддерживается до 100 сохранённых комнат. Авторизации пока нет; любой человек с локальной ссылкой может менять доску. Не храните в ней конфиденциальные данные.
+
+### Restore deleted cards / Возврат карточки
+After server-confirmed deletion, Restore is available for up to 30 seconds. It restores only that card; repeated restores cannot duplicate it. The transient undo record is scoped to the room and is lost on server restart. Storage failure is reported instead of silently claiming success. Existing shared-local-link permissions remain unchanged.
+После подтверждённого удаления карточку можно вернуть до 30 секунд. Повтор не создаёт копию и не затирает другие изменения. История возврата не переживает перезапуск сервера; права по локальной ссылке остаются прежними.
+Startup diagnostics: `cargo run --release -- --check` checks the database location and local port without starting a server. / Проверка запуска без сервера: `--check`.
