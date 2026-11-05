@@ -49,6 +49,12 @@ fn write(connection: &mut Connection, job: &WriteJob) -> Result<(), SaveError> {
     if result.is_ok() {
         return Ok(());
     }
+    // Failed rollback/commit may leave this connection inside an uncommitted transaction.
+    // Never mistake a read of its staged rows for durable confirmation.
+    if !connection.is_autocommit() {
+        let _ = connection.execute_batch("ROLLBACK");
+        return Err(SaveError::Uncertain);
+    }
     // A write error must not be turned into a blind retry if its final state cannot be read.
     let saved = connection
         .query_row(
@@ -58,7 +64,9 @@ fn write(connection: &mut Connection, job: &WriteJob) -> Result<(), SaveError> {
         )
         .optional();
     match saved {
-        Ok(Some((json, next))) if json == job.json && next == job.next_id => Ok(()),
+        Ok(Some((json, next))) if json == job.json && next == job.next_id => {
+            Err(SaveError::Uncertain)
+        }
         Ok(_) => Err(SaveError::Failed),
         Err(_) => Err(SaveError::Uncertain),
     }
@@ -135,6 +143,33 @@ impl Persistence for Store {
 mod tests {
     use super::*;
     use crate::model::Command;
+    fn job() -> WriteJob {
+        let (reply, _) = oneshot::channel();
+        WriteJob {
+            id: "test-room-123".into(),
+            json: "{}".into(),
+            next_id: 1,
+            deadline: Instant::now() + Duration::from_secs(2),
+            reply,
+        }
+    }
+    #[test]
+    fn matching_row_after_sql_error_is_not_a_durable_ack() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("CREATE TABLE rooms(id TEXT PRIMARY KEY,snapshot TEXT NOT NULL,next_id INTEGER NOT NULL); INSERT INTO rooms VALUES('test-room-123','{}',1); CREATE TRIGGER reject_write BEFORE UPDATE ON rooms BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;
+        assert_eq!(write(&mut connection, &job()), Err(SaveError::Uncertain));
+        Ok(())
+    }
+    #[test]
+    fn staged_rows_are_never_confirmation() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("CREATE TABLE rooms(id TEXT PRIMARY KEY,snapshot TEXT NOT NULL,next_id INTEGER NOT NULL); BEGIN; INSERT INTO rooms VALUES('test-room-123','{}',1);")?;
+        assert_eq!(write(&mut connection, &job()), Err(SaveError::Uncertain));
+        assert!(connection.is_autocommit());
+        let count: u64 = connection.query_row("SELECT count(*) FROM rooms", [], |r| r.get(0))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
     #[tokio::test]
     async fn snapshot_and_legacy_rows_survive_reopening() -> Result<()> {
         let temp = tempfile::tempdir()?;

@@ -40,6 +40,7 @@ mod tests {
     struct TestStore {
         pause: AtomicBool,
         fail: AtomicBool,
+        uncertain: AtomicBool,
         saves: AtomicUsize,
         started: Notify,
         resume: Notify,
@@ -49,6 +50,7 @@ mod tests {
             Arc::new(Self {
                 pause: AtomicBool::new(pause),
                 fail: AtomicBool::new(false),
+                uncertain: AtomicBool::new(false),
                 saves: AtomicUsize::new(0),
                 started: Notify::new(),
                 resume: Notify::new(),
@@ -68,7 +70,9 @@ mod tests {
                     self.started.notify_one();
                     self.resume.notified().await;
                 }
-                if self.fail.load(Ordering::SeqCst) {
+                if self.uncertain.load(Ordering::SeqCst) {
+                    Err(SaveError::Uncertain)
+                } else if self.fail.load(Ordering::SeqCst) {
                     Err(SaveError::Failed)
                 } else {
                     Ok(())
@@ -82,6 +86,19 @@ mod tests {
             expected_revision: Some(revision),
             command,
         }
+    }
+    #[tokio::test]
+    async fn uncertain_storage_blocks_further_mutations_until_restart() {
+        let store = TestStore::new(false);
+        store.uncertain.store(true, Ordering::SeqCst);
+        let room = RoomHandle::spawn("room-one-123".into(), RoomData::default(), store.clone());
+        let ack = room.command(request("request-one", 0, crate::model::Command::StopTimer)).await;
+        assert_eq!(ack.error_code, Some("uncertain"));
+        store.uncertain.store(false, Ordering::SeqCst);
+        let ack = room.command(request("request-two", 0, crate::model::Command::StopTimer)).await;
+        assert_eq!(ack.error_code, Some("uncertain"));
+        assert_eq!(store.saves.load(Ordering::SeqCst), 1);
+        assert_eq!(room.snapshot.borrow().revision, 0);
     }
     #[tokio::test]
     async fn blocked_room_does_not_block_another_room_or_publish_early() {
