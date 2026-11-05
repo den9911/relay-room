@@ -1,8 +1,11 @@
 name: Rust
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -13,6 +16,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           cargo fmt --all
+          git -c color.ui=false diff -- src
           cargo clippy --all-targets --all-features
       - run: cargo test
       - run: cargo build --release
@@ -22,3 +26,6 @@ jobs:
       - name: WebSocket restore
         if: matrix.os == 'ubuntu-latest'
         run: python3 tests/restore.py
+      - name: Room isolation and safe retry
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 tests/quality.py
