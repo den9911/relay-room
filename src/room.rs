@@ -92,10 +92,14 @@ mod tests {
         let store = TestStore::new(false);
         store.uncertain.store(true, Ordering::SeqCst);
         let room = RoomHandle::spawn("room-one-123".into(), RoomData::default(), store.clone());
-        let ack = room.command(request("request-one", 0, crate::model::Command::StopTimer)).await;
+        let ack = room
+            .command(request("request-one", 0, crate::model::Command::StopTimer))
+            .await;
         assert_eq!(ack.error_code, Some("uncertain"));
         store.uncertain.store(false, Ordering::SeqCst);
-        let ack = room.command(request("request-two", 0, crate::model::Command::StopTimer)).await;
+        let ack = room
+            .command(request("request-two", 0, crate::model::Command::StopTimer))
+            .await;
         assert_eq!(ack.error_code, Some("uncertain"));
         assert_eq!(store.saves.load(Ordering::SeqCst), 1);
         assert_eq!(room.snapshot.borrow().revision, 0);
