@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -21,6 +21,24 @@ pub enum SaveError {
 pub type SaveFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SaveError>> + Send + 'a>>;
 pub trait Persistence: Send + Sync + 'static {
     fn save<'a>(&'a self, id: &'a str, room: &'a RoomData, deadline: Instant) -> SaveFuture<'a>;
+    fn diagnostics(&self) -> Option<StorageStatus> { None }
+}
+#[derive(serde::Serialize)]
+pub struct StorageStatus {
+    accepting: bool,
+    needs_restart: bool,
+    queued: usize,
+    queue_capacity: usize,
+    committed: u64,
+    rejected: u64,
+    uncertain: u64,
+}
+#[derive(Default)]
+struct Counters {
+    needs_restart: AtomicBool,
+    committed: AtomicU64,
+    rejected: AtomicU64,
+    uncertain: AtomicU64,
 }
 struct WriteJob {
     id: String,
@@ -31,6 +49,7 @@ struct WriteJob {
 }
 pub struct Store {
     sender: mpsc::Sender<WriteJob>,
+    counters: Arc<Counters>,
 }
 
 fn write(connection: &mut Connection, job: &WriteJob) -> Result<(), SaveError> {
@@ -103,19 +122,40 @@ impl Store {
             result
         };
         let (sender, mut receiver) = mpsc::channel::<WriteJob>(WRITE_QUEUE);
+        let counters = Arc::new(Counters::default());
+        let worker_counters = counters.clone();
         std::thread::Builder::new()
             .name("relay-sqlite".into())
             .spawn(move || {
                 while let Some(job) = receiver.blocking_recv() {
                     let result = write(&mut connection, &job);
+                    match result {
+                        Ok(()) => { worker_counters.committed.fetch_add(1, Ordering::Relaxed); }
+                        Err(SaveError::Uncertain | SaveError::Stopped) => {
+                            worker_counters.uncertain.fetch_add(1, Ordering::Relaxed);
+                            worker_counters.needs_restart.store(true, Ordering::Relaxed);
+                        }
+                        Err(SaveError::Busy | SaveError::Failed) => { worker_counters.rejected.fetch_add(1, Ordering::Relaxed); }
+                    }
                     let _ = job.reply.send(result);
                 }
             })?;
-        Ok((Arc::new(Self { sender }), loaded))
+        Ok((Arc::new(Self { sender, counters }), loaded))
     }
 }
 
 impl Persistence for Store {
+    fn diagnostics(&self) -> Option<StorageStatus> {
+        Some(StorageStatus {
+            accepting: !self.sender.is_closed(),
+            needs_restart: self.counters.needs_restart.load(Ordering::Relaxed),
+            queued: WRITE_QUEUE - self.sender.capacity(),
+            queue_capacity: WRITE_QUEUE,
+            committed: self.counters.committed.load(Ordering::Relaxed),
+            rejected: self.counters.rejected.load(Ordering::Relaxed),
+            uncertain: self.counters.uncertain.load(Ordering::Relaxed),
+        })
+    }
     fn save<'a>(&'a self, id: &'a str, room: &'a RoomData, deadline: Instant) -> SaveFuture<'a> {
         Box::pin(async move {
             let json = serde_json::to_string(room).map_err(|_| SaveError::Failed)?;

@@ -140,8 +140,9 @@ async fn js() -> impl IntoResponse {
         include_str!("../web/app.js"),
     )
 }
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"ok":true}))
+async fn health(State(app): State<App>) -> Json<serde_json::Value> {
+    // Liveness stays separate from storage readiness. No room content or paths are exposed.
+    Json(serde_json::json!({"ok":true,"storage":app.storage.diagnostics()}))
 }
 #[tokio::main]
 async fn main() -> Result<()> {

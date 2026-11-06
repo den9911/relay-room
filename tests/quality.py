@@ -21,7 +21,9 @@ class WS:
         key=base64.b64encode(os.urandom(16)).decode()
         self.socket.sendall((f'GET /ws/{room} HTTP/1.1\r\nHost: 127.0.0.1:3001\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: http://127.0.0.1:3001\r\n\r\n').encode())
         status=self.file.readline()
-        assert b'101' in status, status
+        if b'101' not in status:
+            self.close()
+            raise AssertionError(status)
         while self.file.readline()!=b'\r\n':
             pass
     def send(self, value):
@@ -62,64 +64,68 @@ def start(root, db):
 def command(request_id,revision,kind,**kwargs):
     return {'type':kind,'request_id':request_id,'expected_revision':revision,**kwargs}
 
-with tempfile.TemporaryDirectory(prefix='relay quality ')as directory:
-    root=pathlib.Path(directory);db=root/'room.sqlite'
-    with sqlite3.connect(db)as conn:
-        conn.execute('CREATE TABLE rooms(id TEXT PRIMARY KEY,snapshot TEXT NOT NULL,next_id INTEGER NOT NULL)')
-        conn.execute('INSERT INTO rooms VALUES(?,?,?)',('quality-room-one',json.dumps({'cards':[{'id':1,'text':'legacy','done':False}],'timer_ends':None}),2))
-    process=start(root,db);connections=[]
-    try:
-        a=WS('quality-room-one');connections.append(a);assert a.read()['revision']==0
-        first=command('request-first-add',0,'add',text='newcard')
-        ack,snapshot=a.ack(first);assert ack['ok'] and len(snapshot['cards'])==2
-        ack,snapshot=a.ack(first);assert ack['ok'] and ack['duplicate'] and len(snapshot['cards'])==2
-        ack,_=a.ack({**first,'text':'changed payload'});assert ack['error_code']=='conflict'
-
-        b=WS('quality-room-two');connections.append(b);b.read()
-        ack,_=b.ack(command('request-second-add',0,'add',text='other room'));assert ack['ok']
+def main():
+    with tempfile.TemporaryDirectory(prefix='relay quality ')as directory:
+        root=pathlib.Path(directory);db=root/'room.sqlite'
         with sqlite3.connect(db)as conn:
-            conn.executescript("CREATE TRIGGER reject_room BEFORE UPDATE ON rooms WHEN new.id='quality-room-one' BEGIN SELECT RAISE(ABORT,'private fixture'); END;")
-        ack,snapshot=a.ack(command('request-failed-toggle',1,'toggle',id=2))
-        assert not ack['ok'] and ack['error_code']=='storage' and snapshot['revision']==1
-        assert not snapshot['cards'][1]['done'] and 'private fixture' not in json.dumps(ack)
-        with sqlite3.connect(db)as conn:conn.execute('DROP TRIGGER reject_room')
-
-        # A blocked SQLite writer cannot hold the room registry or the async runtime.
-        lock=sqlite3.connect(db);lock.execute('BEGIN IMMEDIATE')
-        blocked=command('request-blocked-toggle',1,'toggle',id=2);a.send(blocked);time.sleep(.1)
+            conn.execute('CREATE TABLE rooms(id TEXT PRIMARY KEY,snapshot TEXT NOT NULL,next_id INTEGER NOT NULL)')
+            conn.execute('INSERT INTO rooms VALUES(?,?,?)',('quality-room-one',json.dumps({'cards':[{'id':1,'text':'legacy','done':False}],'timer_ends':None}),2))
+        process=start(root,db);connections=[]
         try:
-            urllib.request.urlopen('http://127.0.0.1:3001/health',timeout=.4).close()
-            second_view=WS('quality-room-two',timeout=.4);connections.append(second_view)
-            assert second_view.read()['cards'][0]['text']=='other room'
-        finally:lock.rollback();lock.close()
-        ack=a.until(lambda x:x.get('request_id')=='request-blocked-toggle' and x.get('type')=='ack')
-        assert ack['ok'];a.until(lambda x:'cards' in x and x['revision']==2)
-
-        lost=command('request-lost-answer',2,'add',text='one confirmed effect')
-        a.send(lost);a.close();connections.remove(a)
-        for _ in range(100):
+            a=WS('quality-room-one');connections.append(a);assert a.read()['revision']==0
+            first=command('request-first-add',0,'add',text='newcard')
+            ack,snapshot=a.ack(first);assert ack['ok'] and len(snapshot['cards'])==2
+            ack,snapshot=a.ack(first);assert ack['ok'] and ack['duplicate'] and len(snapshot['cards'])==2
+            ack,_=a.ack({**first,'text':'changed payload'});assert ack['error_code']=='conflict'
+    
+            b=WS('quality-room-two');connections.append(b);b.read()
+            ack,_=b.ack(command('request-second-add',0,'add',text='other room'));assert ack['ok']
+            with sqlite3.connect(db)as conn:
+                conn.executescript("CREATE TRIGGER reject_room BEFORE UPDATE ON rooms WHEN new.id='quality-room-one' BEGIN SELECT RAISE(ABORT,'private fixture'); END;")
+            ack,snapshot=a.ack(command('request-failed-toggle',1,'toggle',id=2))
+            assert not ack['ok'] and ack['error_code']=='storage' and snapshot['revision']==1
+            assert not snapshot['cards'][1]['done'] and 'private fixture' not in json.dumps(ack)
+            with sqlite3.connect(db)as conn:conn.execute('DROP TRIGGER reject_room')
+    
+            # A blocked SQLite writer cannot hold the room registry or the async runtime.
+            lock=sqlite3.connect(db);lock.execute('BEGIN IMMEDIATE')
+            blocked=command('request-blocked-toggle',1,'toggle',id=2);a.send(blocked);time.sleep(.1)
+            try:
+                urllib.request.urlopen('http://127.0.0.1:3001/health',timeout=.4).close()
+                second_view=WS('quality-room-two',timeout=.4);connections.append(second_view)
+                assert second_view.read()['cards'][0]['text']=='other room'
+            finally:lock.rollback();lock.close()
+            ack=a.until(lambda x:x.get('request_id')=='request-blocked-toggle' and x.get('type')=='ack')
+            assert ack['ok'];a.until(lambda x:'cards' in x and x['revision']==2)
+    
+            lost=command('request-lost-answer',2,'add',text='one confirmed effect')
+            a.send(lost);a.close();connections.remove(a)
+            for _ in range(100):
+                with sqlite3.connect(db)as conn:
+                    stored=json.loads(conn.execute('SELECT snapshot FROM rooms WHERE id=?',('quality-room-one',)).fetchone()[0])
+                if any(r['request_id']==lost['request_id']for r in stored.get('recent',[])):break
+                time.sleep(.02)
+            else:raise AssertionError('Detached command did not complete')
+            a=WS('quality-room-one');connections.append(a);assert len(a.read()['cards'])==3
+            ack,snapshot=a.ack(lost);assert ack['ok'] and ack['duplicate'] and len(snapshot['cards'])==3
+    
+            for c in connections:c.close()
+            connections=[];process.terminate();process.wait(timeout=5)
+            process=start(root,db)
+            a=WS('quality-room-one');connections.append(a);snapshot=a.read();assert snapshot['revision']==3
+            ack,snapshot=a.ack(first);assert ack['ok'] and ack['duplicate'] and len(snapshot['cards'])==3
+            for n in range(129):
+                ack,snapshot=a.ack(command(f'request-toggle-{n:04d}',3+n,'toggle',id=2));assert ack['ok']
+            ack,snapshot=a.ack(first);assert not ack['ok'] and ack['error_code']=='conflict'
+            assert len(snapshot['cards'])==3
             with sqlite3.connect(db)as conn:
                 stored=json.loads(conn.execute('SELECT snapshot FROM rooms WHERE id=?',('quality-room-one',)).fetchone()[0])
-            if any(r['request_id']==lost['request_id']for r in stored.get('recent',[])):break
-            time.sleep(.02)
-        else:raise AssertionError('Detached command did not complete')
-        a=WS('quality-room-one');connections.append(a);assert len(a.read()['cards'])==3
-        ack,snapshot=a.ack(lost);assert ack['ok'] and ack['duplicate'] and len(snapshot['cards'])==3
+            assert len(stored['recent'])==128
+            assert all('text'not in receipt and len(receipt['fingerprint'])==32 for receipt in stored['recent'])
+        finally:
+            for c in connections:c.close()
+            if process.poll()is None:process.terminate();process.wait(timeout=5)
+    print('PASS real WebSockets: legacy load, durable ack/replay, storage rejection, nonblocking registry, lost reply, restart and receipt eviction')
 
-        for c in connections:c.close()
-        connections=[];process.terminate();process.wait(timeout=5)
-        process=start(root,db)
-        a=WS('quality-room-one');connections.append(a);snapshot=a.read();assert snapshot['revision']==3
-        ack,snapshot=a.ack(first);assert ack['ok'] and ack['duplicate'] and len(snapshot['cards'])==3
-        for n in range(129):
-            ack,snapshot=a.ack(command(f'request-toggle-{n:04d}',3+n,'toggle',id=2));assert ack['ok']
-        ack,snapshot=a.ack(first);assert not ack['ok'] and ack['error_code']=='conflict'
-        assert len(snapshot['cards'])==3
-        with sqlite3.connect(db)as conn:
-            stored=json.loads(conn.execute('SELECT snapshot FROM rooms WHERE id=?',('quality-room-one',)).fetchone()[0])
-        assert len(stored['recent'])==128
-        assert all('text'not in receipt and len(receipt['fingerprint'])==32 for receipt in stored['recent'])
-    finally:
-        for c in connections:c.close()
-        if process.poll()is None:process.terminate();process.wait(timeout=5)
-print('PASS real WebSockets: legacy load, durable ack/replay, storage rejection, nonblocking registry, lost reply, restart and receipt eviction')
+if __name__ == "__main__":
+    main()

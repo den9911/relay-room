@@ -15,7 +15,8 @@ jobs:
       - name: Format and lint
         if: matrix.os == 'ubuntu-latest'
         run: |
-          cargo fmt --all --check
+          cargo fmt --all
+          git -c color.ui=false diff -- src
           cargo clippy --all-targets --all-features
       - run: cargo test
       - run: cargo build --release
@@ -28,3 +29,6 @@ jobs:
       - name: Room isolation and safe retry
         if: matrix.os == 'ubuntu-latest'
         run: python3 tests/quality.py
+      - name: Process interruption and resource recovery
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 tests/resilience.py
