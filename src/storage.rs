@@ -4,7 +4,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -21,7 +24,9 @@ pub enum SaveError {
 pub type SaveFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SaveError>> + Send + 'a>>;
 pub trait Persistence: Send + Sync + 'static {
     fn save<'a>(&'a self, id: &'a str, room: &'a RoomData, deadline: Instant) -> SaveFuture<'a>;
-    fn diagnostics(&self) -> Option<StorageStatus> { None }
+    fn diagnostics(&self) -> Option<StorageStatus> {
+        None
+    }
 }
 #[derive(serde::Serialize)]
 pub struct StorageStatus {
@@ -130,12 +135,16 @@ impl Store {
                 while let Some(job) = receiver.blocking_recv() {
                     let result = write(&mut connection, &job);
                     match result {
-                        Ok(()) => { worker_counters.committed.fetch_add(1, Ordering::Relaxed); }
+                        Ok(()) => {
+                            worker_counters.committed.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(SaveError::Uncertain | SaveError::Stopped) => {
                             worker_counters.uncertain.fetch_add(1, Ordering::Relaxed);
                             worker_counters.needs_restart.store(true, Ordering::Relaxed);
                         }
-                        Err(SaveError::Busy | SaveError::Failed) => { worker_counters.rejected.fetch_add(1, Ordering::Relaxed); }
+                        Err(SaveError::Busy | SaveError::Failed) => {
+                            worker_counters.rejected.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     let _ = job.reply.send(result);
                 }
