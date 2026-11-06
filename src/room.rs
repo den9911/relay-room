@@ -31,6 +31,172 @@ pub struct Ack {
     pub undo_until: Option<u64>,
 }
 
+impl Ack {
+    pub fn new(request: &Request, revision: u64, code: Option<&'static str>) -> Self {
+        Self {
+            kind: "ack",
+            request_id: request.request_id.clone(),
+            operation: request.operation(),
+            ok: code.is_none(),
+            revision,
+            duplicate: false,
+            error_code: code,
+            error: if code.is_some() {
+                "Action not confirmed / Действие не подтверждено"
+            } else {
+                ""
+            },
+            can_restore: false,
+            undo_until: None,
+        }
+    }
+    fn with_undo(mut self, room: &RoomData) -> Self {
+        if let Some(op) = &self.operation {
+            if let Some(record) = room
+                .deleted
+                .get(op)
+                .filter(|d| !d.restored && d.until >= now())
+            {
+                self.can_restore = true;
+                self.undo_until = Some(record.until);
+            }
+        }
+        self
+    }
+}
+pub struct RoomHandle {
+    sender: mpsc::Sender<Pending>,
+    pub snapshot: watch::Receiver<Arc<Snapshot>>,
+    pub updates: broadcast::Sender<Arc<Snapshot>>,
+}
+impl RoomHandle {
+    pub fn spawn(id: String, mut room: RoomData, storage: Arc<dyn Persistence>) -> Arc<Self> {
+        let (sender, mut receiver) = mpsc::channel::<Pending>(COMMAND_QUEUE);
+        let (published, snapshot) = watch::channel(Arc::new(room.snapshot.clone()));
+        let (updates, _) = broadcast::channel(8);
+        let broadcast = updates.clone();
+        tokio::spawn(async move {
+            let mut uncertain = false;
+            while let Some(pending) = receiver.recv().await {
+                let ack = execute(
+                    &id,
+                    &mut room,
+                    &pending.request,
+                    pending.deadline,
+                    &*storage,
+                    &mut uncertain,
+                )
+                .await;
+                if ack.ok && !ack.duplicate {
+                    let snapshot = Arc::new(room.snapshot.clone());
+                    published.send_replace(snapshot.clone());
+                    let _ = broadcast.send(snapshot);
+                }
+                let _ = pending.reply.send(ack);
+            }
+        });
+        Arc::new(Self {
+            sender,
+            snapshot,
+            updates,
+        })
+    }
+    pub async fn command(&self, request: Request) -> Ack {
+        let fallback = Ack::new(&request, self.snapshot.borrow().revision, Some("busy"));
+        let (reply, received) = oneshot::channel();
+        if self
+            .sender
+            .try_send(Pending {
+                request,
+                deadline: Instant::now() + COMMAND_BUDGET,
+                reply,
+            })
+            .is_err()
+        {
+            return fallback;
+        }
+        received.await.unwrap_or(Ack {
+            error_code: Some("uncertain"),
+            ..fallback
+        })
+    }
+}
+async fn execute(
+    id: &str,
+    room: &mut RoomData,
+    request: &Request,
+    deadline: Instant,
+    storage: &dyn Persistence,
+    uncertain: &mut bool,
+) -> Ack {
+    let revision = room.snapshot.revision;
+    if !request.valid() {
+        return Ack::new(request, revision, Some("invalid"));
+    }
+    if *uncertain {
+        return Ack::new(request, revision, Some("uncertain"));
+    }
+    let Some(fingerprint) = request.fingerprint() else {
+        return Ack::new(request, revision, Some("invalid"));
+    };
+    if let (Some(request_id), Some(expected)) = (&request.request_id, request.expected_revision) {
+        if let Some(receipt) = room.recent.iter().find(|r| r.request_id == *request_id) {
+            if receipt.fingerprint != fingerprint || receipt.expected_revision != expected {
+                return Ack::new(request, revision, Some("conflict"));
+            }
+            let mut ack = Ack::new(request, receipt.revision, None).with_undo(room);
+            ack.duplicate = true;
+            return ack;
+        }
+        // Evicted receipts never turn an old request into a fresh mutation.
+        if expected != revision {
+            return Ack::new(request, revision, Some("conflict"));
+        }
+    }
+    if Instant::now() >= deadline {
+        return Ack::new(request, revision, Some("busy"));
+    }
+    if revision >= MAX_SAFE_ID {
+        return Ack::new(request, revision, Some("invalid"));
+    }
+    let mut candidate = room.clone();
+    if !candidate.apply(&request.command) {
+        return Ack::new(request, revision, Some("invalid"));
+    }
+    candidate.snapshot.revision += 1;
+    if let (Some(request_id), Some(expected_revision)) =
+        (&request.request_id, request.expected_revision)
+    {
+        candidate.recent.push(Receipt {
+            request_id: request_id.clone(),
+            fingerprint,
+            expected_revision,
+            revision: candidate.snapshot.revision,
+        });
+        if candidate.recent.len() > RECEIPTS {
+            candidate.recent.remove(0);
+        }
+    }
+    match storage.save(id, &candidate, deadline).await {
+        Ok(()) => {
+            *room = candidate;
+            Ack::new(request, room.snapshot.revision, None).with_undo(room)
+        }
+        Err(error) => {
+            let code = match error {
+                SaveError::Busy => "busy",
+                SaveError::Failed => "storage",
+                SaveError::Uncertain | SaveError::Stopped => {
+                    *uncertain = true;
+                    "uncertain"
+                }
+            };
+            Ack::new(request, revision, Some(code))
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,169 +429,5 @@ mod tests {
         assert_eq!(ack.error_code, Some("busy"));
         store.resume.notify_one();
         assert!(waiter.await.expect("task").ok);
-    }
-}
-impl Ack {
-    pub fn new(request: &Request, revision: u64, code: Option<&'static str>) -> Self {
-        Self {
-            kind: "ack",
-            request_id: request.request_id.clone(),
-            operation: request.operation(),
-            ok: code.is_none(),
-            revision,
-            duplicate: false,
-            error_code: code,
-            error: if code.is_some() {
-                "Action not confirmed / Действие не подтверждено"
-            } else {
-                ""
-            },
-            can_restore: false,
-            undo_until: None,
-        }
-    }
-    fn with_undo(mut self, room: &RoomData) -> Self {
-        if let Some(op) = &self.operation {
-            if let Some(record) = room
-                .deleted
-                .get(op)
-                .filter(|d| !d.restored && d.until >= now())
-            {
-                self.can_restore = true;
-                self.undo_until = Some(record.until);
-            }
-        }
-        self
-    }
-}
-pub struct RoomHandle {
-    sender: mpsc::Sender<Pending>,
-    pub snapshot: watch::Receiver<Arc<Snapshot>>,
-    pub updates: broadcast::Sender<Arc<Snapshot>>,
-}
-impl RoomHandle {
-    pub fn spawn(id: String, mut room: RoomData, storage: Arc<dyn Persistence>) -> Arc<Self> {
-        let (sender, mut receiver) = mpsc::channel::<Pending>(COMMAND_QUEUE);
-        let (published, snapshot) = watch::channel(Arc::new(room.snapshot.clone()));
-        let (updates, _) = broadcast::channel(8);
-        let broadcast = updates.clone();
-        tokio::spawn(async move {
-            let mut uncertain = false;
-            while let Some(pending) = receiver.recv().await {
-                let ack = execute(
-                    &id,
-                    &mut room,
-                    &pending.request,
-                    pending.deadline,
-                    &*storage,
-                    &mut uncertain,
-                )
-                .await;
-                if ack.ok && !ack.duplicate {
-                    let snapshot = Arc::new(room.snapshot.clone());
-                    published.send_replace(snapshot.clone());
-                    let _ = broadcast.send(snapshot);
-                }
-                let _ = pending.reply.send(ack);
-            }
-        });
-        Arc::new(Self {
-            sender,
-            snapshot,
-            updates,
-        })
-    }
-    pub async fn command(&self, request: Request) -> Ack {
-        let fallback = Ack::new(&request, self.snapshot.borrow().revision, Some("busy"));
-        let (reply, received) = oneshot::channel();
-        if self
-            .sender
-            .try_send(Pending {
-                request,
-                deadline: Instant::now() + COMMAND_BUDGET,
-                reply,
-            })
-            .is_err()
-        {
-            return fallback;
-        }
-        received.await.unwrap_or_else(|_| Ack {
-            error_code: Some("uncertain"),
-            ..fallback
-        })
-    }
-}
-async fn execute(
-    id: &str,
-    room: &mut RoomData,
-    request: &Request,
-    deadline: Instant,
-    storage: &dyn Persistence,
-    uncertain: &mut bool,
-) -> Ack {
-    let revision = room.snapshot.revision;
-    if !request.valid() {
-        return Ack::new(request, revision, Some("invalid"));
-    }
-    if *uncertain {
-        return Ack::new(request, revision, Some("uncertain"));
-    }
-    let Some(fingerprint) = request.fingerprint() else {
-        return Ack::new(request, revision, Some("invalid"));
-    };
-    if let (Some(request_id), Some(expected)) = (&request.request_id, request.expected_revision) {
-        if let Some(receipt) = room.recent.iter().find(|r| r.request_id == *request_id) {
-            if receipt.fingerprint != fingerprint || receipt.expected_revision != expected {
-                return Ack::new(request, revision, Some("conflict"));
-            }
-            let mut ack = Ack::new(request, receipt.revision, None).with_undo(room);
-            ack.duplicate = true;
-            return ack;
-        }
-        // Evicted receipts never turn an old request into a fresh mutation.
-        if expected != revision {
-            return Ack::new(request, revision, Some("conflict"));
-        }
-    }
-    if Instant::now() >= deadline {
-        return Ack::new(request, revision, Some("busy"));
-    }
-    if revision >= MAX_SAFE_ID {
-        return Ack::new(request, revision, Some("invalid"));
-    }
-    let mut candidate = room.clone();
-    if !candidate.apply(&request.command) {
-        return Ack::new(request, revision, Some("invalid"));
-    }
-    candidate.snapshot.revision += 1;
-    if let (Some(request_id), Some(expected_revision)) =
-        (&request.request_id, request.expected_revision)
-    {
-        candidate.recent.push(Receipt {
-            request_id: request_id.clone(),
-            fingerprint,
-            expected_revision,
-            revision: candidate.snapshot.revision,
-        });
-        if candidate.recent.len() > RECEIPTS {
-            candidate.recent.remove(0);
-        }
-    }
-    match storage.save(id, &candidate, deadline).await {
-        Ok(()) => {
-            *room = candidate;
-            Ack::new(request, room.snapshot.revision, None).with_undo(room)
-        }
-        Err(error) => {
-            let code = match error {
-                SaveError::Busy => "busy",
-                SaveError::Failed => "storage",
-                SaveError::Uncertain | SaveError::Stopped => {
-                    *uncertain = true;
-                    "uncertain"
-                }
-            };
-            Ack::new(request, revision, Some(code))
-        }
     }
 }

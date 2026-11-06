@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_SAVED_BYTES: usize = 512 * 1024;
 pub const WRITE_QUEUE: usize = 32;
+pub type LoadedRooms = Vec<(String, RoomData)>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveError {
     Busy,
@@ -97,7 +98,7 @@ fn write(connection: &mut Connection, job: &WriteJob) -> Result<(), SaveError> {
 }
 
 impl Store {
-    pub fn open(path: &str) -> Result<(Arc<Self>, Vec<(String, RoomData)>)> {
+    pub fn open(path: &str) -> Result<(Arc<Self>, LoadedRooms)> {
         let mut connection = Connection::open(path).context("opening room database")?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, snapshot TEXT NOT NULL, next_id INTEGER NOT NULL)")?;
         let loaded = {
